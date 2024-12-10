@@ -57,7 +57,7 @@ def check_idempotent(self, fn, *args, **kwargs):
 
 
 # Legacy tinygemm ops
-def _get_groupwise_affine_qparams(w, n_bit=4, groupsize=128, dtype=torch.bfloat16):
+def _get_groupwise_affine_qparams(w, n_bit=4, groupsize=128, dtype=torch.bfloat16, zp_domain=ZeroPointDomain.FLOAT):
     if groupsize > w.shape[-1]:
         groupsize = w.shape[-1]
     assert groupsize > 1
@@ -70,11 +70,18 @@ def _get_groupwise_affine_qparams(w, n_bit=4, groupsize=128, dtype=torch.bfloat1
     max_val = to_quant.amax(dim=1, keepdim=True)
     min_val = to_quant.amin(dim=1, keepdim=True)
     max_int = 2**n_bit - 1
+    quant_min = 2**(n_bit-1) - 1
+    quant_max = - 2**(n_bit-1)
     scales = (max_val - min_val).clamp(min=1e-6) / max_int
-    zeros = min_val + scales * (2 ** (n_bit - 1))
-    return scales.to(dtype=dtype).reshape(w.shape[0], -1), zeros.to(
-        dtype=dtype
-    ).reshape(w.shape[0], -1)
+    scales = scales.to(dtype=dtype).reshape(w.shape[0], -1)
+    if (zp_domain == ZeroPointDomain.FLOAT):
+        zeros = min_val + scales * (2 ** (n_bit - 1))
+        zeros = zeros.to(dtype=dtype).reshape(w.shape[0], -1)
+    else:
+        zeros = quant_min - torch.round(min_val / scales)
+        zeros = torch.clamp(zeros, quant_min, quant_max)
+        zeros = zeros.to(dtype=dtype).reshape(w.shape[0], -1)
+    return scales, zeros
 
 
 def _groupwise_affine_quantize_tensor_from_qparams(
@@ -83,6 +90,7 @@ def _groupwise_affine_quantize_tensor_from_qparams(
     zeros,
     n_bit=4,
     groupsize=128,
+    zero_point_domain=ZeroPointDomain.FLOAT
 ):
     assert groupsize > 1
     # needed for GPTQ single column quantize
@@ -97,23 +105,35 @@ def _groupwise_affine_quantize_tensor_from_qparams(
 
     scales = scales.reshape(-1, 1)
     zeros = zeros.reshape(-1, 1)
-    min_val = zeros - scales * (2 ** (n_bit - 1))
     max_int = 2**n_bit - 1
     min_int = 0
-    w_int4x8 = (
-        to_quant.sub(min_val)
-        .div(scales)
-        .round()
-        .clamp_(min_int, max_int)
-        .to(torch.int32)
-        .reshape_as(w)
-    )
+    if zero_point_domain == ZeroPointDomain.FLOAT:
+        zeros = zeros.reshape(-1, 1)
+        min_val = zeros - scales * (2 ** (n_bit - 1))
+        max_int = 2**n_bit - 1
+        min_int = 0
+        w_int4x8 = (
+            to_quant.sub(min_val)
+            .div(scales)
+            .round()
+            .clamp_(min_int, max_int)
+            .to(torch.int32)
+            .reshape_as(w)
+        )
+    else:
+        w_int4x8 = (
+            to_quant.mul(scales)
+            .round()
+            .clamp_(min_int, max_int)
+            .add(zeros)
+            .to(torch.int32)
+            .reshape_as(w)
+        )
+
     if TORCH_VERSION_AT_LEAST_2_5:
-        if not (is_device(w.device.type, "cpu") and TORCH_VERSION_AT_LEAST_2_6):
+        if not ((is_device(w.device.type, "cpu") or (is_device(w.device, "xpu"))) and TORCH_VERSION_AT_LEAST_2_6):
             w_int4x8 = (w_int4x8[::, ::2] << 4 | w_int4x8[::, 1::2]).to(torch.uint8)
-
     return w_int4x8
-
 
 def _groupwise_affine_dequantize_tensor_from_qparams(
     w_int4x8,
@@ -121,6 +141,7 @@ def _groupwise_affine_dequantize_tensor_from_qparams(
     zeros,
     n_bit=4,
     groupsize=128,
+    zero_point_domain=ZeroPointDomain.FLOAT
 ):
     assert groupsize > 1
     # needed for GPTQ single column dequantize
@@ -133,12 +154,19 @@ def _groupwise_affine_dequantize_tensor_from_qparams(
     scales = scales.reshape(-1, 1)
     zeros = zeros.reshape(-1, 1)
 
-    w_dq = (
-        w_int4x8_grouped.sub(2 ** (n_bit - 1))
-        .mul(scales)
-        .add(zeros)
-        .reshape_as(w_int4x8)
-    )
+    if zero_point_domain == ZeroPointDomain.FLOAT:
+        w_dq = (
+            w_int4x8_grouped.sub(2 ** (n_bit - 1))
+            .mul(scales)
+            .add(zeros)
+            .reshape_as(w_int4x8)
+        )
+    else:
+        w_dq = (
+            w_int4x8_grouped.sub(zeros)
+            .mul(scales)
+            .reshape_as(w_int4x8)
+        )
     return w_dq
 
 
@@ -704,7 +732,7 @@ class TestQuantPrimitives(unittest.TestCase):
 
         if TORCH_VERSION_AT_LEAST_2_5:
             input_tmp = input
-            if not (is_device(input.device.type, "cpu") and TORCH_VERSION_AT_LEAST_2_6):
+            if not ((is_device(input.device.type, "cpu") or (is_device(input.device.type, "xpu"))) and TORCH_VERSION_AT_LEAST_2_6):
                 input_tmp = (input[::, ::2] << 4 | input[::, 1::2]).to(torch.uint8)
             w_bf16 = groupwise_affine_dequantize_tensor_from_qparams(
                 input_tmp, scales, zeros, n_bit, groupsize

@@ -19,7 +19,7 @@ from torch.ao.quantization import MinMaxObserver, QConfigMapping
 from torchao.quantization.dynamic_quant import (
     DynamicallyPerAxisQuantizedLinear,
 )
-from torchao.dtypes import TensorCoreTiledLayout, Int4CPULayout
+from torchao.dtypes import TensorCoreTiledLayout, Int4CPULayout, Int4XPULayout
 from torchao.quantization.quant_api import (
     int4_weight_only,
     int8_weight_only,
@@ -107,6 +107,8 @@ COMMON_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 COMMON_DEVICE_DTYPE = list(itertools.product(COMMON_DEVICES, COMMON_DTYPES)).copy()
 
+XPU_DEVICE_DTYPE = list(itertools.product(["xpu"], [torch.float16, torch.bfloat16])).copy()
+
 def _int8wo_api(mod):
     if TORCH_VERSION_AT_LEAST_2_4:
         quantize_(mod, int8_weight_only(), set_inductor_config=False)
@@ -136,6 +138,9 @@ def _int8da_int8w_api(mod):
 def _int4wo_api(mod):
     if is_device(next(mod.parameters()).device.type, "cpu") and TORCH_VERSION_AT_LEAST_2_6:
         quantize_(mod, int4_weight_only(layout=Int4CPULayout()), set_inductor_config=False)
+        unwrap_tensor_subclass(mod)
+    elif is_device(next(mod.parameters()).device.type, "xpu") and TORCH_VERSION_AT_LEAST_2_6:
+        quantize_(mod, int4_weight_only(layout=Int4XPULayout()), set_inductor_config=False)
         unwrap_tensor_subclass(mod)
     elif TORCH_VERSION_AT_LEAST_2_4:
         quantize_(mod, int4_weight_only(), set_inductor_config=False)
@@ -184,6 +189,8 @@ def run_supported_device_dtype(test_method):
             raise unittest.SkipTest(f"Need CUDA available.")
         if device == "cuda" and torch.cuda.is_available() and dtype == torch.bfloat16 and torch.cuda.get_device_capability() < (8, 0):
             raise unittest.SkipTest("Need CUDA and SM80+ available.")
+        if device == "xpu" and not torch.cuda.is_xpu_available():
+            raise unittest.SkipTest(f"Need XPU available.")
         return test_method(*args, **kwargs)
     return wrapper
 
@@ -675,7 +682,7 @@ class TestSubclass(unittest.TestCase):
                 Int4WeightOnlyQuantizedLinearWeight.from_float, device, 15, test_shape=test_shape, test_dtype=dtype
             )
 
-    @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @parameterized.expand(COMMON_DEVICE_DTYPE + XPU_DEVICE_DTYPE)
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_3, "int4 requires torch nightly.")
     # @unittest.skipIf(TORCH_VERSION_AT_LEAST_2_5, "int4 skipping 2.5+ for now")
     def test_dequantize_int4_weight_only_quant_subclass_grouped(self, device, dtype):
@@ -686,7 +693,7 @@ class TestSubclass(unittest.TestCase):
         m_shapes = [16, 256] + ([1] if device=="cuda" else [])
         n_shapes = [16] + ([8, 13] if device=="cuda" else [])
         for groupsize in [256, 128]:
-            for inner_k_tiles in [8, 4, 2]:
+            for inner_k_tiles in ([8, 4, 2] if device != "xpu" else [8]):
                 for m in m_shapes:
                     for n in n_shapes:
                         self._test_dequantize_impl(
@@ -1168,7 +1175,7 @@ class TestSaveLoadMeta(unittest.TestCase):
         undo_recommended_configs()
         self._test_handle_save_load_meta_impl(_int8wo_api, device, test_dtype=dtype)
 
-    @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @parameterized.expand(COMMON_DEVICE_DTYPE + XPU_DEVICE_DTYPE)
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_3, "int4 requires torch 2.3+.")
     # @unittest.skipIf(TORCH_VERSION_AT_LEAST_2_5, "int4 doesn't work for 2.5+ right now")
     @torch.no_grad()
