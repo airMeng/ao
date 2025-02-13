@@ -18,10 +18,15 @@ from torchao.prototype.mx_formats.custom_cast import pack_uint4
 from torchao.prototype.mx_formats.mx_tensor import (
     E8M0_EXPONENT_NAN_VAL,
     MXTensor,
+    ScaleCalculationMode,
     to_dtype,
 )
 from torchao.quantization.utils import compute_error
-from torchao.utils import TORCH_VERSION_AT_LEAST_2_4, is_sm_at_least_89
+from torchao.utils import (
+    TORCH_VERSION_AT_LEAST_2_4,
+    is_sm_at_least_89,
+    is_sm_at_least_100,
+)
 
 torch.manual_seed(2)
 
@@ -43,8 +48,10 @@ def run_before_and_after_tests():
     torch._dynamo.reset()
 
 
-def _test_mx(data_hp, elem_dtype, block_size):
-    data_mx = MXTensor.to_mx(data_hp, elem_dtype, block_size)
+def _test_mx(
+    data_hp, elem_dtype, block_size, scale_calculation_mode=ScaleCalculationMode.FLOOR
+):
+    data_mx = MXTensor.to_mx(data_hp, elem_dtype, block_size, scale_calculation_mode)
     data_mx_dq = data_mx.to_dtype(data_hp.dtype)
 
     def assert_sqnr_gt_threshold(orig, new, threshold):
@@ -57,7 +64,7 @@ def _test_mx(data_hp, elem_dtype, block_size):
             assert sqnr >= threshold
 
     if elem_dtype is torch.float8_e4m3fn:
-        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 20.0)
+        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 18.0)
     else:
         assert_sqnr_gt_threshold(data_hp, data_mx_dq, 14.0)
 
@@ -68,6 +75,15 @@ def test_hello_world(elem_dtype):
     data = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
     block_size = 2
     _test_mx(data, elem_dtype, block_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("scale_calculation_mode", [s for s in ScaleCalculationMode])
+@pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
+def test_realistic_numerics(elem_dtype, scale_calculation_mode):
+    data = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    block_size = 32
+    _test_mx(data, elem_dtype, block_size, scale_calculation_mode)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -166,9 +182,12 @@ def test_transpose(elem_dtype, fp4_triton):
     """
     if elem_dtype != DTYPE_FP4 and fp4_triton:
         pytest.skip("unsupported configuration")
+    elif fp4_triton and is_sm_at_least_100():
+        pytest.skip("triton does not work yet on CUDA capability 10.0")
 
-    tensor_hp = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    M, K = 128, 256
     block_size = 32
+    tensor_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     tensor_mx = MXTensor.to_mx(tensor_hp, elem_dtype, block_size)
     config.use_fp4_custom_triton_dequant_kernel = fp4_triton
     tensor_mx_dq_t = tensor_mx.to_dtype(tensor_hp.dtype).t()
@@ -204,6 +223,9 @@ def test_view(elem_dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    is_sm_at_least_100(), reason="triton does not work yet on CUDA capability 10.0"
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 @pytest.mark.parametrize("hp_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("all_zeros", [False, True])

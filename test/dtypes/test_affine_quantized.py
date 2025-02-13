@@ -11,6 +11,7 @@ from torch.testing._internal.common_utils import (
 from torchao.dtypes import CutlassInt4PackedLayout, Int4XPULayout, Int4CPULayout, SemiSparseLayout
 from torchao.quantization import (
     float8_weight_only,
+    int4_dynamic_activation_int4_weight,
     int4_weight_only,
     int8_dynamic_activation_int4_weight,
     int8_dynamic_activation_int8_weight,
@@ -22,6 +23,10 @@ from torchao.utils import (
     TORCH_VERSION_AT_LEAST_2_6,
     TORCH_VERSION_AT_LEAST_2_7,
     is_sm_at_least_89,
+)
+
+is_cusparselt_available = (
+    hasattr(torch.backends, "cusparselt") and torch.backends.cusparselt.is_available()
 )
 
 
@@ -70,6 +75,7 @@ def get_quantization_functions(
                         layout=CutlassInt4PackedLayout(),
                     )
                 )
+                base_functions.append(int4_dynamic_activation_int4_weight())
 
     if do_sparse:
         base_functions.append(
@@ -104,7 +110,8 @@ class TestAffineQuantized(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
     @common_utils.parametrize(
-        "apply_quant", get_quantization_functions(True, True, "cuda", True)
+        "apply_quant",
+        get_quantization_functions(is_cusparselt_available, True, "cuda", True),
     )
     def test_weights_only(self, apply_quant):
         linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device="cuda")
@@ -181,7 +188,9 @@ class TestAffineQuantized(TestCase):
 
         deregister_aqt_quantized_linear_dispatch(dispatch_condition)
 
-    @common_utils.parametrize("apply_quant", get_quantization_functions(True, True))
+    @common_utils.parametrize(
+        "apply_quant", get_quantization_functions(is_cusparselt_available, True)
+    )
     @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
     def test_print_quantized_module(self, apply_quant):
         linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device="cuda")
