@@ -30,6 +30,7 @@ from torchao.dtypes import (
     CutlassInt4PackedLayout,
     Float8Layout,
     Int4CPULayout,
+    Int4XPULayout,
     MarlinQQQLayout,
     MarlinSparseLayout,
     PlainLayout,
@@ -122,12 +123,14 @@ LAYOUT_TO_ZERO_POINT_DOMAIN = {
     TensorCoreTiledLayout: [ZeroPointDomain.FLOAT],
     MarlinSparseLayout: [ZeroPointDomain.INT],
     Int4CPULayout: [ZeroPointDomain.FLOAT],
+    Int4XPULayout:[ZeroPointDomain.INT],
 }
 
 LAYOUT_TO_PRESERVE_ZEROS = {
     TensorCoreTiledLayout: False,
     MarlinSparseLayout: True,
     Int4CPULayout: False,
+    Int4XPULayout: True,
 }
 
 
@@ -726,6 +729,9 @@ def int4_weight_only(
         eps = 1e-6
         preserve_zero = LAYOUT_TO_PRESERVE_ZEROS[type(layout)]
         zero_point_dtype = torch.bfloat16
+        # TODO : optimize zero_point_dtype look up.
+        if isinstance(layout, Int4XPULayout):
+            zero_point_dtype = torch.int8
 
         nonlocal zero_point_domain
         assert (
