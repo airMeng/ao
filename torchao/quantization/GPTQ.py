@@ -21,10 +21,11 @@ from torchao.dtypes.utils import is_device
 from torchao.utils import (
     TORCH_VERSION_AT_LEAST_2_3,
     TORCH_VERSION_AT_LEAST_2_6,
+    TORCH_VERSION_AT_LEAST_2_7,
     find_multiple,
 )
 
-from .quant_primitives import MappingType
+from .quant_primitives import ZeroPointDomain, MappingType
 from .unified import Quantizer
 from .utils import (
     _MultiInput,
@@ -536,6 +537,8 @@ def linear_forward_int4(
     groupsize: int,
     precision: torch.dtype = torch.bfloat16,
     scales_precision: torch.dtype = torch.bfloat16,
+    scales: Optional [torch.Tensor] = None,
+    zeros: Optional [torch.Tensor] = None
 ):
     origin_x_size = x.size()
     x = x.reshape(-1, origin_x_size[-1])
@@ -546,6 +549,22 @@ def linear_forward_int4(
             groupsize,
             scales_and_zeros.to(scales_precision),
         ).to(dtype=x.dtype)
+    elif is_device(x.device.type, "xpu") and TORCH_VERSION_AT_LEAST_2_7:
+        if scales_and_zeros is None:
+            c = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
+                x.to(precision),
+                weight_int4pack,
+                groupsize,
+                scales.to(scales_precision),
+                zeros
+            ).to(dtype=x.dtype)
+        else:
+            c = torch.ops.aten._weight_int4pack_mm(
+                x.to(precision),
+                weight_int4pack,
+                groupsize,
+                scales_and_zeros.to(scales_precision),
+            ).to(dtype=x.dtype)
     else:
         c = torch.ops.aten._weight_int4pack_mm(
             x.to(precision),
@@ -574,8 +593,10 @@ class WeightOnlyInt4Linear(torch.nn.Module):
         dtype=None,
         groupsize: int = 128,
         inner_k_tiles: int = 8,
+        zero_point_domain: ZeroPointDomain = ZeroPointDomain.FLOAT,
         precision: torch.dtype = torch.bfloat16,
         scales_precision: torch.dtype = torch.bfloat16,
+        zeros_precision: torch.dtype = torch.uint8
     ) -> None:
         super().__init__()
         self.padding = not _check_linear_int4_k(in_features, groupsize, inner_k_tiles)
@@ -589,8 +610,10 @@ class WeightOnlyInt4Linear(torch.nn.Module):
         self.device = device
         self.groupsize = groupsize
         self.inner_k_tiles = inner_k_tiles
+        self.zero_point_domain = zero_point_domain
         self.precision = precision
         self.scales_precision = scales_precision
+        self.zeros_precision = zeros_precision
 
         if dtype is not None:
             raise ValueError("Please specify 'precision' instead of 'dtype'")
@@ -626,14 +649,32 @@ class WeightOnlyInt4Linear(torch.nn.Module):
                 ),
             )
         self.dtype = dtype
-        self.register_buffer(
-            "scales_and_zeros",
-            torch.zeros(
-                (in_features // groupsize, out_features, 2),
-                dtype=self.scales_precision,
-                device=device,
-            ),
-        )
+        if self.zero_point_domain == ZeroPointDomain.FLOAT:
+            self.register_buffer(
+                "scales_and_zeros",
+                torch.zeros(
+                    (in_features // groupsize, out_features, 2),
+                    dtype=self.scales_precision,
+                    device=device,
+                ),
+            )
+        else:
+            self.register_buffer(
+                "scales",
+                torch.zeros(
+                    (in_features // groupsize, out_features),
+                    dtype=self.scales_precision,
+                    device=device,
+                ),
+            )
+            self.register_buffer(
+                "zeros",
+                torch.zeros(
+                    (in_features // groupsize, out_features),
+                    dtype=self.zeros_precision,
+                    device=device,
+                )
+            )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.padding:
@@ -646,6 +687,8 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             self.groupsize,
             self.precision,
             self.scales_precision,
+            self.scales,
+            self.zeros
         )
 
 
